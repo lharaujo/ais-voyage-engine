@@ -1,0 +1,22 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Environments
+venv/
+.env
+
+# Data & Local Databases (Ignore the data folder contents)
+data/
+*.db
+*.parquet
+
+# Modal & IDEs
+.modal/
+.vscode/
+.idea/
+
+# Distribution / Build
+dist/
+build/
+*.egg-info/
