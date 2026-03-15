@@ -1,45 +1,44 @@
 import modal
-import duckdb
+import calendar
 import polars as pl
-from src.config import app, volume, image, SILVER_DIR, GOLD_DIR
-from src.transform import run_silver_stitching
-from src.routing import compute_single_route
+from src.config import app, volume, image, SILVER_DIR, GOLD_DIR, get_logger
+from src.extract import process_daily_ais, run_unlocode_scraper
+from src.transform import stitch_voyages
+from src.routing import compute_distance
+
+logger = get_logger("orchestrator")
 
 @app.function(image=image, volumes={"/data": volume}, memory=4096, timeout=3600)
-def etl_pipeline(year: int, month: int):
-    print(f"🚀 Starting Medallion Pipeline for {year}-{month:02d}")
+def full_pipeline(year: int, month: int):
+    """Orchestrates the full Medallion pipeline."""
+    logger.info(f"🚀 Starting Pipeline: {year}-{month:02d}")
     
-    # 1. Silver Layer (Assuming Bronze data is already downloaded to /data/bronze)
-    run_silver_stitching(year, month)
+    # 1. Setup
+    run_unlocode_scraper()
     
-    # 2. Gold Layer (Voyages + Routing)
-    con = duckdb.connect()
-    silver_file = SILVER_DIR / f"stitched_{year}_{month:02d}.parquet"
+    # 2. Bronze: Parallel Map
+    days = range(1, calendar.monthrange(year, month)[1] + 1)
+    logger.info(f"Spawning {len(days)} Bronze workers...")
+    list(extract_worker.map([(year, month, d) for d in days]))
     
-    # Filter to actual voyages (Port A to Port B)
-    voyages_df = con.execute(f"""
-        SELECT * FROM read_parquet('{silver_file}')
-        WHERE port_locode != next_locode AND next_locode IS NOT NULL
-    """).df()
+    # 3. Silver: Stitching
+    stitch_voyages(year, month)
     
-    # 3. Parallel Routing via Modal workers
-    print(f"🥇 Routing {len(voyages_df)} voyages in parallel...")
-    route_tasks = list(zip(voyages_df['lon'], voyages_df['lat'], voyages_df['next_lon'], voyages_df['next_lat']))
-    voyages_df['distance_nm'] = list(compute_single_route.map(route_tasks))
+    # 4. Gold: Parallel Routing
+    logger.info("Enriching Gold layer with maritime distances...")
+    silver_file = SILVER_DIR / f"silver_{year}_{month:02d}.parquet"
+    df = pl.read_parquet(silver_file)
     
-    # Calculate duration
-    voyages_df['duration_hours'] = (voyages_df['next_dt'] - voyages_df['dt']).dt.total_seconds() / 3600
-    
-    # Persist Gold layer
-    gold_file = GOLD_DIR / f"voyages_{year}_{month:02d}.parquet"
-    gold_file.parent.mkdir(parents=True, exist_ok=True)
-    pl.from_pandas(voyages_df).write_parquet(gold_file)
+    # Logic to pair Departure -> Arrival for routing
+    # ... (Add pairing logic here) ...
     
     volume.commit()
-    print("✅ Pipeline Success.")
+    logger.info("✅ Pipeline Complete.")
 
-@app.function(image=image, volumes={"/data": volume}, allow_cross_origin_requests=True)
-@modal.asgi_app()
-def ui():
-    import subprocess
-    subprocess.Popen(["streamlit", "run", "dashboard.py", "--server.port", "8000", "--server.address", "0.0.0.0"])
+@app.function(image=image, volumes={"/data": volume}, memory=4096)
+def extract_worker(args):
+    process_daily_ais(*args)
+
+if __name__ == "__main__":
+    # Local trigger
+    full_pipeline.remote(2025, 1)

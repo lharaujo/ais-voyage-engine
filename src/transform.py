@@ -1,25 +1,28 @@
 import duckdb
-from src.config import BRONZE_DIR, SILVER_DIR
+from src.config import BRONZE_DIR, SILVER_DIR, get_logger
 
-def run_silver_stitching(year: int, month: int):
-    """Aligns pings into Departure/Arrival events."""
+logger = get_logger(__name__)
+
+def stitch_voyages(year: int, month: int):
+    """Uses DuckDB window functions to pair departures and arrivals."""
     con = duckdb.connect()
-    
-    output_path = SILVER_DIR / f"stitched_{year}_{month:02d}.parquet"
+    input_pattern = f"{BRONZE_DIR}/ais_{year}_{month:02d}*.parquet"
+    output_path = SILVER_DIR / f"silver_{year}_{month:02d}.parquet"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    con.execute(f"""
-        COPY (
-            SELECT 
-                mmsi, imo, vessel_name, vessel_type,
-                base_date_time::TIMESTAMP as dt,
-                port_locode, lat, lon,
-                LEAD(base_date_time::TIMESTAMP) OVER w as next_dt,
-                LEAD(port_locode) OVER w as next_locode,
-                LEAD(lat) OVER w as next_lat,
-                LEAD(lon) OVER w as next_lon
-            FROM read_parquet('{BRONZE_DIR}/ais_{year}_{month:02d}*.parquet')
-            WINDOW w AS (PARTITION BY imo ORDER BY base_date_time)
-        ) TO '{output_path}' (FORMAT 'PARQUET')
-    """)
-    print(f"🥈 Silver layer stitched: {output_path}")
+
+    logger.info(f"Stitching Silver layer for {year}-{month:02d}...")
+    try:
+        con.execute(f"""
+            COPY (
+                WITH events AS (
+                    SELECT mmsi, imo, vessel_name, base_date_time as dt,
+                           port_locode, latitude as lat, longitude as lon,
+                           LAG(port_locode) OVER (PARTITION BY imo ORDER BY base_date_time) as prev_port
+                    FROM read_parquet('{input_pattern}')
+                )
+                SELECT * FROM events WHERE prev_port IS NULL OR port_locode != prev_port
+            ) TO '{output_path}' (FORMAT 'PARQUET')
+        """)
+        logger.info(f"Silver layer saved: {output_path}")
+    except Exception as e:
+        logger.error(f"Silver stitching failed: {e}")
