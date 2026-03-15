@@ -1,0 +1,21 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  quality-check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+        cache: 'pip'
+    - run: pip install .[dev]
+    - run: black --check src/ app.py dashboard.py
+    - run: flake8 src/ app.py --count --max-line-length=100 --statistics
+    - run: pytest tests/
