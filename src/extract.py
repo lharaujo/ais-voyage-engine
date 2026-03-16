@@ -8,7 +8,7 @@ import zstandard as zstd
 from bs4 import BeautifulSoup
 from scipy.spatial import cKDTree
 
-from src.config import BRONZE_DIR, UNLOCODE_PATH, get_logger
+from src.config import SILVER_DIR, UNLOCODE_PATH, get_logger
 
 logger = get_logger(__name__)
 
@@ -89,16 +89,16 @@ def process_daily_ais(year, month, day):
 
     try:
         resp = requests.get(url, stream=True, timeout=60)
-        resp.status_code == 200
+        # Check if the download actually worked
+        resp.raise_for_status()
         logger.info(f"Success ais-{date_str} downloaded")
-        return resp.content
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP Error for {year}-{month}-{day}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
+        # DELETE 'return resp.content' FROM HERE!
 
-    # Decompress and filter in one pass using Polars Lazy
+    except Exception as e:
+        logger.error(f"Download failed for {date_str}: {e}")
+        return  # Here it is okay to return because we can't continue without data
+
+    # NOW the code below will actually execute...
     with tempfile.NamedTemporaryFile(suffix=".csv") as tmp:
         dctx = zstd.ZstdDecompressor()
         with dctx.stream_reader(resp.raw) as reader:
@@ -121,5 +121,5 @@ def process_daily_ais(year, month, day):
                     pl.Series("port_name", ports_df["Name"].to_numpy()[idx[mask]]),
                 ]
             )
-            out_path = BRONZE_DIR / f"ais_{year}_{month:02d}_{day:02d}.parquet"
+            out_path = SILVER_DIR / f"ais_{year}_{month:02d}_{day:02d}.parquet"
             res.write_parquet(out_path)
