@@ -2,7 +2,6 @@ import os
 import re
 import tempfile
 
-import numpy as np
 import polars as pl
 import requests
 import zstandard as zstd
@@ -150,6 +149,8 @@ def process_daily_ais(year: int, month: int, day: int):
     """
     Downloads and spatially filters AIS data within 5km of ports.
     """
+    import numpy as np
+
     try:
         # 1. Load Reference Data
         if not os.path.exists(PORTS_PATH):
