@@ -9,17 +9,21 @@ import modal
 app = modal.App("ais-voyage-engine")
 volume = modal.Volume.from_name("ais-data-store", create_if_missing=True)
 
-image = modal.Image.debian_slim().pip_install(
-    "polars",
-    "duckdb",
-    "requests",
-    "zstandard",
-    "scipy",
-    "numpy",
-    "searoute",
-    "tqdm",
-    "beautifulsoup4",
-    "pandas",
+image = (
+    modal.Image.debian_slim()
+    .pip_install(
+        "polars",
+        "duckdb",
+        "requests",
+        "zstandard",
+        "scipy",
+        "numpy",
+        "searoute",
+        "tqdm",
+        "beautifulsoup4",
+        "pandas",
+    )
+    .add_local_python_source("src")
 )
 
 # --- 2. PATHS & CONSTANTS (Hybrid Logic) ---
@@ -35,23 +39,41 @@ else:
 BRONZE_DIR = DATA_PATH / "bronze"
 SILVER_DIR = DATA_PATH / "silver"
 GOLD_DIR = DATA_PATH / "gold"
-# Note: I added a slash between reference and ports.parquet for safety
-UNLOCODE_PATH = DATA_PATH / "reference" / "ports.parquet"
+REFERENCE_DIR = DATA_PATH / "reference"
+PORTS_PATH = REFERENCE_DIR / "ports.parquet"
 
-# Ensure local directories exist so the code doesn't crash
+# Ensure local directories exist for developer ergonomics
 if not os.environ.get("MODAL_IMAGE_ID"):
-    BRONZE_DIR.mkdir(parents=True, exist_ok=True)
-    SILVER_DIR.mkdir(parents=True, exist_ok=True)
-    (DATA_PATH / "reference").mkdir(parents=True, exist_ok=True)
+    for path in [BRONZE_DIR, SILVER_DIR, GOLD_DIR, REFERENCE_DIR]:
+        path.mkdir(parents=True, exist_ok=True)
+
 
 # --- 3. LOGGING CONFIGURATION ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-
-
 def get_logger(name: str):
-    """Returns a logger instance for the specified module name."""
-    return logging.getLogger(name)
+    """Returns a standardized logger instance."""
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+    return logger
+
+
+# --- 4. UTILITIES ---
+
+
+def call_searoute(origin_coords, dest_coords):
+    """
+    Calculates maritime distance.
+    Lazy-loaded import to keep config.py lightweight for other modules.
+    """
+    # Fixed F821: Parameters now correctly passed to function body
+    try:
+        import searoute
+
+        route = searoute.searoute(origin_coords, dest_coords)
+        return route["properties"]["length"]
+    except Exception:  # Fixed E722: Now catching Exception explicitly
+        return None
