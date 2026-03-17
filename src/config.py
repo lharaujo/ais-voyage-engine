@@ -6,27 +6,15 @@ from pathlib import Path
 import modal
 
 # --- 1. CLOUD INFRASTRUCTURE ---
-# Define the image FIRST
+# Define the image FIRST and read directly from your pyproject.toml
 image = (
-    modal.Image.debian_slim(python_version="3.12").pip_install(
-        "polars",
-        "duckdb",
-        "requests",
-        "zstandard",
-        "scipy",
-        "numpy",
-        "searoute",
-        "tqdm",
-        "beautifulsoup4",
-        "pandas",
-    )
-    # This is key: it tells Modal that 'src' is a package
-    .add_local_python_source("src")
+    modal.Image.debian_slim(python_version="3.12")
+    # Tell Modal to install dependencies straight from your local toml file
+    .pip_install_from_pyproject("pyproject.toml").add_local_python_source("src")
 )
 
-# Pass the image to the App definition
-
-app = modal.App("ais-voyage-engine")
+# Attach the image to the app! (This is the critical fix)
+app = modal.App("ais-voyage-engine", image=image)
 volume = modal.Volume.from_name("ais-data-store", create_if_missing=True)
 
 # --- 2. PATHS & CONSTANTS (Hybrid Logic) ---
