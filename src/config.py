@@ -6,12 +6,9 @@ from pathlib import Path
 import modal
 
 # --- 1. CLOUD INFRASTRUCTURE ---
-app = modal.App("ais-voyage-engine")
-volume = modal.Volume.from_name("ais-data-store", create_if_missing=True)
-
+# Define the image FIRST
 image = (
-    modal.Image.debian_slim()
-    .pip_install(
+    modal.Image.debian_slim(python_version="3.12").pip_install(
         "polars",
         "duckdb",
         "requests",
@@ -23,8 +20,14 @@ image = (
         "beautifulsoup4",
         "pandas",
     )
+    # This is key: it tells Modal that 'src' is a package
     .add_local_python_source("src")
 )
+
+# Pass the image to the App definition
+
+app = modal.App("ais-voyage-engine")
+volume = modal.Volume.from_name("ais-data-store", create_if_missing=True)
 
 # --- 2. PATHS & CONSTANTS (Hybrid Logic) ---
 
