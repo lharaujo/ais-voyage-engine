@@ -1,212 +1,220 @@
-import calendar
 import os
+import shutil
+import subprocess
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
 
 import modal
 import polars as pl
 
-from src.config import SILVER_DIR, app, get_logger, image, volume
-
-# ADDED: run_unlocode_bootstrap added to imports
-from src.extract import process_daily_ais, run_unlocode_bootstrap
-
-# Ensure these exist in your transform.py
+from src.config import (
+    BRONZE_DIR,
+    GOLD_DIR,
+    PORTS_PATH,
+    REFERENCE_DIR,
+    SILVER_DIR,
+    app,
+    get_logger,
+    image,
+    volume,
+)
+from src.extract import AISProcessor, run_unlocode_bootstrap
 from src.transform import stitch_voyages
 
 logger = get_logger("orchestrator")
 
-# Create a persistent dictionary named "port-distances"
-# This survives even after the app stops running
-distance_lookup = modal.Dict.from_name("port-distances", create_if_missing=True)
-distance_cache = modal.Dict.from_name("maritime-distance-cache", create_if_missing=True)
+# --- WORKERS & UTILS ---
+
+
+@app.function(
+    image=image,
+    volumes={"/data": volume},
+    secrets=[modal.Secret.from_name("github-auth")],
+)
+def sync_to_github():
+    token = os.environ.get("GH_TOKEN")
+    if not token:
+        logger.error("GH_TOKEN secret not found.")
+        return
+
+    repo_name = "ais-voyage-engine"
+    user = "lharaujo"
+    repo_url = f"https://{token}@github.com/{user}/{repo_name}.git"
+    local_repo = Path("/tmp/ais_repo")
+    gold_dir = Path("/data/gold")
+
+    files = sorted(gold_dir.glob("voyages_*.parquet"))
+    if not files:
+        logger.error("No gold files found in volume to sync!")
+        return
+
+    latest_file = files[-1]
+    target_file = local_repo / "data" / "gold" / "voyages.parquet"
+
+    try:
+        if local_repo.exists():
+            shutil.rmtree(local_repo)
+
+        logger.info(f"Cloning {repo_name}...")
+        subprocess.run(["git", "clone", "--depth", "1", repo_url, str(local_repo)], check=True)
+
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(latest_file, target_file)
+
+        os.chdir(local_repo)
+        subprocess.run(["git", "config", "user.email", "bot@modal.com"], check=True)
+        subprocess.run(["git", "config", "user.name", "Modal Data Bot"], check=True)
+
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], capture_output=True, text=True
+        ).stdout
+
+        if not status:
+            logger.info("No changes detected. Skipping push.")
+            return
+
+        subprocess.run(["git", "add", "data/gold/voyages.parquet"], check=True)
+        subprocess.run(["git", "commit", "-m", f"Auto-update: {datetime.now().date()}"], check=True)
+        subprocess.run(["git", "push", "origin", "main"], check=True)
+
+        logger.info("Successfully pushed latest gold data to GitHub!")
+    except Exception as e:
+        logger.error(f"Sync failed: {e}")
+
+
+@app.function(image=image, memory=1024, retries=3)
+def compute_route_metrics(row: dict):
+    from src.voyage_enrichment import compute_route_metrics
+
+    cache = modal.Dict.from_name("maritime-distance-cache", create_if_missing=True)
+    return compute_route_metrics(row, cache)
+
+
+# --- MAIN PIPELINE ---
 
 
 @app.function(image=image, volumes={"/data": volume}, memory=8192, timeout=3600)
 def full_pipeline(year: int, month: int):
     logger.info(f"🚀 Starting Pipeline: {year}-{month:02d}")
 
-    # --- START OF BOOTSTRAP LOGIC ---
-    # Check if reference data exists before starting extraction
-    ports_path = "/data/reference/ports.parquet"
-    if not os.path.exists(ports_path):
-        logger.warning("⚠️ Reference data (ports.parquet) missing! Initializing bootstrap...")
-        # Trigger the scraper we adapted in extract.py
-        # Using .remote() ensures it runs in its own optimized container context
-        run_unlocode_bootstrap.remote()
+    # Create the directories directly on the mounted Volume
+    for folder in [SILVER_DIR, GOLD_DIR, REFERENCE_DIR, BRONZE_DIR]:
+        os.makedirs(folder, exist_ok=True)
 
-        # Reload the volume to ensure this worker sees the newly created file
+    # Commit the folder structure so subsequent workers see it
+    volume.commit()
+
+    # Force bootstrap for testing
+    logger.info("Forcing bootstrap for testing...")
+    run_unlocode_bootstrap.remote()
+
+    while not os.path.exists(PORTS_PATH):
+        logger.info("Waiting for PORTS_PATH to become visible...")
+        time.sleep(5)
         volume.reload()
-        logger.info("✅ Reference data successfully bootstrapped.")
-    else:
-        logger.info("⚓ Reference data verified.")
-    # --- END OF BOOTSTRAP LOGIC ---
 
-    # 1. Parallel Extraction
-    days = range(1, calendar.monthrange(year, month)[1] + 1)
-    day_args = [(year, month, d) for d in days]
-    for _ in extract_worker.map(day_args, order_outputs=False):
-        pass
+    # 1. Parallel Extraction via AISProcessor
+    # Properly initialize the class with modal.parameter()
+    processor = AISProcessor(model_name="voyage-v1")
+    days_in_month = (
+        (datetime(year, month % 12 + 1, 1) - timedelta(days=1)).day if month < 12 else 31
+    )
+    day_args = [(year, month, d) for d in range(1, days_in_month + 1)]
 
-    volume.reload()
+    logger.info(f"Extracting {days_in_month} days of AIS data...")
+    # Using list() to force execution of the starmap generator
+    results = list(processor.process_day.starmap(day_args, order_outputs=False))
+    for r in results:
+        logger.info(f"Worker report: {r}")
 
-    # 2. Stitching (Silver Layer)
-    logger.info("🧵 Stitching daily files into voyage legs...")
+    volume.commit()  # Save the extracted Parquet files to volume
+
+    # 2. Stitch Voyages (Transformation)
+    logger.info("Stitching AIS pings into voyages...")
     stitch_voyages(year, month)
     volume.reload()
 
-    # 3. Maritime Routing (Gold Layer)
-    logger.info("🛰️ Calculating maritime distances via searoute...")
-    silver_path = SILVER_DIR / f"silver_{year}_{month:02d}.parquet"
-    legs_df = pl.read_parquet(str(silver_path))
+    # 3. Gold Layer Enrichment
+    logger.info("Enriching voyages with maritime distances...")
 
-    # Map the compute_route_metrics function across workers
-    chunk_size = 5000
-    gold_results = []
+    # Look for any silver parquet files for the month
+    silver_files = list(SILVER_DIR.glob(f"ais_{year}_{month:02d}_*.parquet"))
+    if not silver_files:
+        logger.error(f"No silver files found for {year}-{month:02d}. Skipping enrichment.")
+        return
 
-    try:
-        for result in compute_route_metrics.map(legs_df.to_dicts(), order_outputs=False):
-            gold_results.append(result)
-            if len(gold_results) % chunk_size == 0:
-                logger.info(f"📥 Collected {len(gold_results)} / {len(legs_df)} results...")
-    except Exception as e:
-        logger.error(f"❌ Map interrupted: {e}")
+    # Combine all silver files for the month
+    silver_dfs = []
+    for silver_file in silver_files:
+        try:
+            df = pl.read_parquet(str(silver_file))
+            silver_dfs.append(df)
+        except Exception as e:
+            logger.warning(f"Failed to read {silver_file}: {e}")
 
-    # Save the Gold result
+    if not silver_dfs:
+        logger.error("No valid silver files found. Skipping enrichment.")
+        return
+
+    legs_df = pl.concat(silver_dfs)
+    logger.info(f"Enriching {len(legs_df)} voyage legs with maritime distances...")
+
+    gold_results = list(compute_route_metrics.map(legs_df.to_dicts(), order_outputs=False))
     gold_df = pl.DataFrame(gold_results)
 
-    # Perform all calculations in a single clean chain
-    gold_df = gold_df.with_columns(
-        [
-            # Convert strings to datetime using the specific format to avoid errors
-            (
+    # Time and speed calculations
+    if not gold_df.is_empty():
+        # Parse timestamps and calculate duration
+        gold_df = gold_df.with_columns(
+            [
+                pl.col("dep_time").str.to_datetime(strict=False).alias("dep_time_parsed"),
+                pl.col("arr_time").str.to_datetime(strict=False).alias("arr_time_parsed"),
+            ]
+        )
+
+        gold_df = gold_df.with_columns(
+            [
                 (
-                    pl.col("arrival_time").str.to_datetime(format="%Y-%m-%d %H:%M:%S", strict=False)
-                    - pl.col("departure_time").str.to_datetime(
-                        format="%Y-%m-%d %H:%M:%S", strict=False
-                    )
-                ).dt.total_seconds()
-                / 3600
-            ).alias("duration_hrs")
-        ]
-    ).with_columns(
-        [
-            # Use the duration we just calculated to get speed
-            (pl.col("trip_distance_nm") / pl.col("duration_hrs"))
-            .fill_nan(0)
-            .alias("avg_speed_kts")
-        ]
-    )
+                    (pl.col("arr_time_parsed") - pl.col("dep_time_parsed")).dt.total_seconds()
+                    / 3600
+                ).alias("duration_hrs")
+            ]
+        )
 
-    gold_path = f"/data/gold/voyages_{year}_{month:02d}.parquet"
-    os.makedirs("/data/gold", exist_ok=True)
-    if os.path.exists(gold_path):
-        logger.info(f"⏩ Gold file already exists for {year}-{month}, skipping routing.")
-        return
-    gold_df.write_parquet(gold_path)
+        gold_df = gold_df.with_columns(
+            [
+                (pl.col("trip_distance_nm") / pl.col("duration_hrs"))
+                .fill_nan(0)
+                .alias("avg_speed_kts")
+            ]
+        )
+
+        # Clean up temporary columns
+        gold_df = gold_df.drop(["dep_time_parsed", "arr_time_parsed"])
+
+        gold_path = f"/data/gold/voyages_{year}_{month:02d}.parquet"
+        os.makedirs("/data/gold", exist_ok=True)
+        gold_df.write_parquet(gold_path)
+        logger.info(f"Saved gold data to {gold_path}")
 
     volume.commit()
-    logger.info(f"✅ Gold file saved: {gold_path}")
-
-    # Export the cache to a persistent Parquet file for manual analysis
-    logger.info("💾 Exporting distance cache to Parquet...")
-
-    try:
-        # 1. Reference the dict by name directly
-        # 'create_if_missing=False' is safer here since we're just reading
-        cache = modal.Dict.from_name("maritime-distance-cache", create_if_missing=True)
-        cache_items = list(cache.items())
-
-        if cache_items:
-            # 2. Convert to Polars and save to Volume
-            cache_df = pl.DataFrame([{"route_key": k, "dist_km": v} for k, v in cache_items])
-
-            cache_export_path = "/data/reference/port_distances.parquet"
-            os.makedirs("/data/reference", exist_ok=True)
-            cache_df.write_parquet(cache_export_path)
-
-            logger.info(
-                f"✅ Cache backed up: {len(cache_items)} routes saved to {cache_export_path}"
-            )
-        else:
-            logger.warning("⚠️ Cache is empty; nothing to export.")
-
-    except Exception as e:
-        logger.error(f"❌ Failed to export cache: {e}")
-
-    # 3. Final commit to make sure the Parquet file and gold data are persisted
-    volume.commit()
-    logger.info("🏁 Pipeline complete and volume committed.")
+    logger.info("🏁 Pipeline complete.")
 
 
-@app.function(
-    image=image,
-    volumes={"/data": volume},
-    memory=4096,
-    max_containers=5,
-    retries=modal.Retries(
-        max_retries=3,
-        backoff_coefficient=2.0,
-        initial_delay=5.0,
-    ),
-)
-def extract_worker(args):
-    year, month, day = args
-    process_daily_ais(year, month, day)
+# --- AUTOMATION & ENTRYPOINTS ---
+
+
+@app.function(schedule=modal.Cron("0 2 * * *"))
+def daily_update():
+    now = datetime.now()
+    # Run for previous month if today is early in the month, or current month
+    # Here we default to current month for simplicity
+    full_pipeline.remote(now.year, now.month)
+    sync_to_github.remote()
 
 
 @app.local_entrypoint()
 def main(year: int = 2025, month: int = 1):
     full_pipeline.remote(year, month)
-
-
-@app.function(image=image, memory=1024, retries=3)
-def compute_route_metrics(row):
-    import modal  # Imported inside to ensure it's available in the container
-    from searoute import searoute
-
-    # 1. Safely grab the persistent dictionary by name
-    # This ensures the worker connects to the correct shared storage
-    distance_cache = modal.Dict.from_name("maritime-distance-cache", create_if_missing=True)
-
-    origin_code = row["dep_locode"]
-    dest_code = row["arr_locode"]
-    cache_key = f"{origin_code}_{dest_code}"
-
-    dist_km = 0.0
-
-    try:
-        # 2. Check if we already have this distance
-        if cache_key in distance_cache:
-            dist_km = distance_cache[cache_key]
-        else:
-            # 3. Call searoute if missing
-            origin_coords = [row["dep_lon"], row["dep_lat"]]
-            dest_coords = [row["arr_lon"], row["arr_lat"]]
-
-            route_geo = searoute(origin_coords, dest_coords, units="km")
-            dist_km = route_geo["properties"]["length"]
-
-            # 4. Save back to the persistent cache
-            distance_cache[cache_key] = dist_km
-
-    except Exception:
-        # Fallback if searoute or cache fails
-        dist_km = 0.0
-
-    # 5. Derive Nautical Miles mathematically (1 NM = 1.852 KM)
-    dist_nm = dist_km / 1.852 if dist_km > 0 else 0.0
-
-    return {
-        "mmsi": row["mmsi"],
-        "imo": row["imo"],
-        "ship_name": row.get("vessel_name", "Unknown"),
-        "locode_departure": origin_code,
-        "locode_arrival": dest_code,
-        "lat_departure": row["dep_lat"],
-        "lon_departure": row["dep_lon"],
-        "lat_arrival": row["arr_lat"],
-        "lon_arrival": row["arr_lon"],
-        "departure_time": row["dep_time"],
-        "arrival_time": row["arr_time"],
-        "trip_distance_km": dist_km,
-        "trip_distance_nm": dist_nm,
-    }
+    sync_to_github.remote()
