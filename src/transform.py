@@ -3,8 +3,8 @@ from typing import Optional
 import duckdb
 import polars as pl
 
-from datetime_utils import parse_ais_datetime, time_difference_hours
 from src.config import GOLD_DIR, SILVER_DIR, get_logger
+from src.datetime_utils import parse_ais_datetime, time_difference_hours
 from src.settings import AppSettings
 from src.voyage_enrichment import generate_sea_path
 
