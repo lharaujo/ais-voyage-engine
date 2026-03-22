@@ -77,7 +77,7 @@ def sync_to_github():
             logger.info("No changes detected. Skipping push.")
             return
 
-        subprocess.run(["git", "add", "data/gold/voyages.parquet"], check=True)
+        subprocess.run(["git", "add", "-f", "data/gold/voyages.parquet"], check=True)
         subprocess.run(["git", "commit", "-m", f"Auto-update: {datetime.now().date()}"], check=True)
         subprocess.run(["git", "push", "origin", "main"], check=True)
 

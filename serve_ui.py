@@ -10,7 +10,7 @@ volume = modal.Volume.from_name("ais-data-store")
 
 # 2. Define the Image and "Bake" the local code into it
 ui_image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.debian_slim(python_version="3.12")
     .pip_install(
         "streamlit",
         "duckdb",
