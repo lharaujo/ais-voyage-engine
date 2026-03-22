@@ -11,7 +11,17 @@ volume = modal.Volume.from_name("ais-data-store")
 # 2. Define the Image and "Bake" the local code into it
 ui_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("streamlit", "duckdb", "pydeck", "pandas", "polars", "plotly")
+    .pip_install(
+        "streamlit",
+        "duckdb",
+        "pydeck",
+        "pandas",
+        "polars",
+        "plotly",
+        "searoute",
+        "folium",
+        "streamlit-folium",
+    )
     .add_local_dir(".", remote_path="/root")
 )
 

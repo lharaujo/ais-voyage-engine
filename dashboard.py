@@ -1,118 +1,186 @@
-import os
-from pathlib import Path
+import io
+import json
 from typing import Optional
 
-import duckdb
+import folium
+import modal
 import pandas as pd
-import pydeck as pdk
 import streamlit as st
-
+from streamlit_folium import st_folium
 
 # Try to find the latest voyages file
+
+VOL = modal.Volume.from_name("ais-data-store")
+
+
 def find_latest_voyages_file() -> Optional[str]:
     """Find the most recent voyages parquet file."""
-    gold_dir = Path("data/gold")
-    if not gold_dir.exists():
+
+    files_l = []
+    for file in VOL.listdir("gold"):
+        if file.type == modal.volume.FileEntryType.FILE and "voyages" in file.path:
+            files_l.append(file)
+
+    if not files_l:
+        st.warning("⚠️ No voyage files found in volume.")
         return None
-
-    voyages_files = list(gold_dir.glob("voyages*.parquet"))
-    if not voyages_files:
-        return None
-
-    # Return the most recently modified file
-    latest_file = max(voyages_files, key=lambda f: f.stat().st_mtime)
-    return str(latest_file)
+    latest_file = max(files_l, key=lambda f: f.path)
+    return latest_file.path
 
 
-DATA_SOURCE = find_latest_voyages_file() or "data/gold/voyages.parquet"
+DATA_SOURCE = find_latest_voyages_file()
 
 
 @st.cache_data
 def load_data() -> pd.DataFrame:
     """Load voyage data from parquet file."""
     try:
-        if not DATA_SOURCE or not os.path.exists(DATA_SOURCE):
-            st.warning(f"⚠️ Data file not found: {DATA_SOURCE}")
-            return pd.DataFrame()
+        # 1. Stream the file content into a buffer
+        buffer = io.BytesIO()
+        for chunk in VOL.read_file(DATA_SOURCE):
+            buffer.write(chunk)
+        buffer.seek(0)  # Reset buffer pointer to the start
 
-        with duckdb.connect(database=":memory:") as con:
-            query = f"SELECT * FROM read_parquet('{DATA_SOURCE}')"
-            df = con.execute(query).df()
-            return df
+        # 2. Load into DuckDB or Pandas
+        # Since it's now in memory, read_parquet works on the buffer
+        df = pd.read_parquet(buffer)
+        return df
     except Exception as e:
-        st.error(f"❌ Error loading data from {DATA_SOURCE}: {e}")
+        st.error(f"❌ Error loading data: {e}")
         return pd.DataFrame()
 
 
-def render_vessel_view(data: pd.DataFrame, search: str, minimum_dist: int) -> None:
+def render_vessel_view(data: pd.DataFrame, search_imo_name: str, search_locode: str) -> None:
     """Render the vessel tracking visualization."""
     # Filter by minimum distance
-    filtered_df = data[data["trip_distance_nm"] >= minimum_dist].copy()
+    if search_locode:
+        filtered_df = data[data["dep_locode"].astype(str).str.upper() == search_locode].copy()
+    else:
+        filtered_df = data.copy()
 
     # Filter by search query if provided
-    if search:
-        search_upper = search.upper()
+    if search_imo_name:
+        search_upper = search_imo_name.upper()
         is_ship = filtered_df["imo"].astype(str).str.upper().str.contains(
             search_upper
         ) | filtered_df["vessel_name"].astype(str).str.upper().str.contains(search_upper)
         filtered_df = filtered_df[is_ship]
 
-    # Display metrics and info
-    if search and not filtered_df.empty:
+    # Display metrics and info per ship
+    if search_imo_name and not filtered_df.empty:
         ship_name = filtered_df["vessel_name"].iloc[0]
         imo_num = filtered_df["imo"].iloc[0]
-        st.success(f"📍 Tracking: **{ship_name}** (IMO: {imo_num})")
+        if not search_locode:
+            st.success(f"📍 Tracking: **{ship_name}** (IMO: {imo_num})")
+        else:
+            st.success(
+                f"""📍 Tracking: **{ship_name}** (IMO: {imo_num})
+                        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+                        Departing from **{search_locode}**"""
+            )
 
         col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("Voyages this Month", len(filtered_df))
         with col2:
-            total_dist = filtered_df["trip_distance_nm"].sum()
+            total_dist = filtered_df["distance_nm"].sum()
             st.metric("Total Distance (nm)", f"{total_dist:,.0f}")
         with col3:
             avg_speed = filtered_df["avg_speed_kts"].mean()
             st.metric("Avg Speed (kts)", f"{avg_speed:.1f}")
-    elif search:
-        st.error(f"🚫 No voyages found for '{search}' with current filters.")
+    elif search_imo_name:
+        st.error(f"🚫 No voyages found for '{search_imo_name}' with current filters.")
     else:
         st.info("🌍 Displaying global traffic. Use the sidebar to track a specific ship.")
 
+    # Display metrics for location-based search
+    if search_locode and not filtered_df.empty:
+        ship_count = filtered_df["mmsi"].nunique()
+        ships_with_imo = filtered_df["imo"].nunique()
+        ship_visits = len(filtered_df)
+
+        if not search_imo_name:
+            st.success(f"📍 Voyages departing from **{search_locode}**")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Unique Ships", ship_count)
+            with col2:
+                st.metric("Ships with IMO", ships_with_imo)
+            with col3:
+                st.metric("Total # of Voyages", ship_visits)
+    elif search_locode:
+        st.error(f"🚫 No voyages found departing from **{search_locode}** with current filters.")
+    else:
+        st.info("📍 Use the sidebar to filter by departure location code.")
+    st.dataframe(filtered_df)
     # Create visualization
-    if not filtered_df.empty:
-        line_color = [255, 255, 0, 200] if search else [0, 255, 128, 140]
-        line_width = 5 if search else 2
+    if not filtered_df.empty and (search_imo_name or search_locode):
+        # 1. Initialize the Folium Map
+        # Navigation-night style equivalent in Folium is usually CartoDB dark_matter
+        m = folium.Map(location=[20, 0], zoom_start=2, control_scale=True, tiles="cartodb positron")
+        folium.TileLayer(
+            tiles="https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png",
+            attr="Map data: &copy; <a href='http://www.openseamap.org'>OpenSeaMap</a> contributors",
+            name="OpenSeaMap",
+            overlay=True,
+        ).add_to(m)
+        all_bounds = []
 
-        # Ensure path column exists and is valid
-        if "path" in filtered_df.columns:
-            # Filter out rows with invalid paths
-            valid_paths = filtered_df["path"].apply(
-                lambda x: isinstance(x, list)
-                and len(x) > 0
-                and all(isinstance(pt, list) and len(pt) == 2 for pt in x)
-            )
-            filtered_df = filtered_df[valid_paths]
+        for _, row in filtered_df.iterrows():
+            try:
+                path_coords = []
 
-        if not filtered_df.empty:
-            path_layer = pdk.Layer(
-                "PathLayer",
-                filtered_df,
-                get_path="path",
-                get_color=line_color,
-                get_width=line_width,
-                width_min_pixels=2,
-                pickable=True,
-            )
+                # 2. Use Pre-calculated Path from Pipeline
+                # The 'path' column contains a GeoJSON string of the LineString
+                if pd.notnull(row.get("path")):
+                    geo = json.loads(row["path"])
+                    # GeoJSON is [lon, lat], Folium needs [lat, lon]
+                    if geo.get("type") == "LineString" and "coordinates" in geo:
+                        path_coords = [(p[1], p[0]) for p in geo["coordinates"]]
+                    elif geo.get("type") == "MultiLineString" and "coordinates" in geo:
+                        path_coords = [
+                            [(p[1], p[0]) for p in segment] for segment in geo["coordinates"]
+                        ]
 
-            deck = pdk.Deck(
-                layers=[path_layer],
-                initial_view_state=pdk.ViewState(latitude=20, longitude=0, zoom=1.5),
-                map_style="mapbox://styles/mapbox/navigation-night-v1",
-                tooltip={"text": "Vessel: {vessel_name}\nFrom: {dep_locode} to {arr_locode}"},
-            )
+                # Fallback if path is missing (e.g. enrichment failed)
+                if not path_coords:
+                    # Draw simple straight line
+                    path_coords = [
+                        [row["dep_lat"], row["dep_lon"]],
+                        [row["arr_lat"], row["arr_lon"]],
+                    ]
 
-            st.pydeck_chart(deck)
-        else:
-            st.warning("⚠️ No valid voyage paths to display.")
+                # 4. Create the PolyLine
+                # Collect points for auto-centering
+                if path_coords:
+                    if isinstance(path_coords[0][0], (float, int)):
+                        all_bounds.extend(path_coords)
+                    else:
+                        for segment in path_coords:
+                            all_bounds.extend(segment)
+
+                color = "#FFFF00" if search_imo_name else "#00FF80"
+                weight = 4 if search_imo_name else 2
+
+                folium.PolyLine(
+                    locations=path_coords,
+                    color=color,
+                    weight=weight,
+                    opacity=0.8,
+                    tooltip=f"Vessel: {row['vessel_name']}<br>From: "
+                    "{row['dep_locode']} to {row['arr_locode']}",
+                ).add_to(m)
+
+            except Exception as e:
+                st.error(f"Error routing {row['vessel_name']}: {e}")
+
+        if all_bounds:
+            m.fit_bounds(all_bounds)
+        folium.LayerControl().add_to(m)
+
+        # 5. Render the Map
+        st_folium(m, width=None, height=500, returned_objects=[])
+
     else:
         st.info("ℹ️ No data to display with current filters.")
 
@@ -128,7 +196,7 @@ def main() -> None:
 
     st.sidebar.header("🚢 Fleet Search")
 
-    search_query = (
+    search_imo_name = (
         st.sidebar.text_input(
             "Enter IMO or Vessel Name",
             placeholder="e.g. 9444728",
@@ -138,9 +206,17 @@ def main() -> None:
         .upper()
     )
 
-    min_dist = st.sidebar.slider("Min Voyage Distance (nm)", 0, 5000, 50)
+    search_dep_locode = (
+        st.sidebar.text_input(
+            "Enter Departure Location Code",
+            placeholder="e.g. USNYC",
+            help="Search for voyages departing from a specific location.",
+        )
+        .strip()
+        .upper()
+    )
 
-    render_vessel_view(df, search_query, min_dist)
+    render_vessel_view(df, search_imo_name, search_dep_locode)
 
 
 if __name__ == "__main__":

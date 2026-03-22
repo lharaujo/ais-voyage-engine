@@ -9,7 +9,7 @@ PORT_PROXIMITY_RADIUS_KM = 5.0
 KM_TO_NM_CONVERSION = 1.852
 
 # Coordinate Precision
-COORDINATE_PRECISION_DECIMALS = 4  # ~11 meter precision
+COORDINATE_PRECISION_DECIMALS = 10  # ~11 meter precision
 
 # Path Optimization
 PATH_DOWNSAMPLING_CONFIG = {

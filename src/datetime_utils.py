@@ -11,7 +11,7 @@ def parse_ais_datetime(col: pl.Expr) -> pl.Expr:
 
 def time_difference_hours(start_col: pl.Expr, end_col: pl.Expr) -> pl.Expr:
     """Calculate time difference in hours between two datetime columns."""
-    return (end_col - start_col).dt.total_seconds() / 3600
+    return (end_col - start_col).dt.total_seconds() / 3600 * (-1)
 
 
 def normalize_timestamp(ts: Optional[str]) -> Optional[datetime]:

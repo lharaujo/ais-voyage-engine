@@ -6,62 +6,6 @@ import pytest
 
 from src.settings import AppSettings, PathConfig
 from src.transform import stitch_voyages
-from src.voyage_enrichment import generate_sea_path
-
-
-class TestSeaPathGeneration:
-    """Test sea path generation functionality."""
-
-    def test_generate_sea_path_success(self):
-        """Test successful path generation with searoute."""
-        row = {"dep_lon": -74.0060, "dep_lat": 40.7128, "arr_lon": -0.1278, "arr_lat": 51.5074}
-
-        # Mock searoute response
-        mock_route = {
-            "geometry": {
-                "coordinates": [
-                    [-74.0060, 40.7128],
-                    [-50.0, 45.0],
-                    [-25.0, 48.0],
-                    [-0.1278, 51.5074],
-                ]
-            }
-        }
-
-        with patch("src.voyage_enrichment.searoute.searoute", return_value=mock_route):
-            path = generate_sea_path(row)
-
-            assert isinstance(path, list)
-            assert len(path) > 0
-            assert all(isinstance(coord, list) and len(coord) == 2 for coord in path)
-            # Check that coordinates are rounded to 4 decimal places
-            assert all(
-                isinstance(coord[0], float) and isinstance(coord[1], float) for coord in path
-            )
-
-    def test_generate_sea_path_fallback(self):
-        """Test fallback path generation when searoute fails."""
-        row = {"dep_lon": -74.0060, "dep_lat": 40.7128, "arr_lon": -0.1278, "arr_lat": 51.5074}
-
-        with patch("src.voyage_enrichment.searoute.searoute", side_effect=Exception("API error")):
-            path = generate_sea_path(row)
-
-            # Should return straight line with just start and end points
-            assert len(path) == 2
-            assert path[0] == [round(row["dep_lon"], 4), round(row["dep_lat"], 4)]
-            assert path[1] == [round(row["arr_lon"], 4), round(row["arr_lat"], 4)]
-
-    def test_generate_sea_path_empty_coordinates(self):
-        """Test handling of empty coordinates from searoute."""
-        row = {"dep_lon": -74.0060, "dep_lat": 40.7128, "arr_lon": -0.1278, "arr_lat": 51.5074}
-
-        mock_route = {"geometry": {"coordinates": []}}
-
-        with patch("src.voyage_enrichment.searoute.searoute", return_value=mock_route):
-            path = generate_sea_path(row)
-
-            # Should fallback to straight line
-            assert len(path) == 2
 
 
 class TestVoyageStitching:

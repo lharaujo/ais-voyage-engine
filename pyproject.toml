@@ -22,7 +22,9 @@ dependencies = [
     "plotly>=5.18.0",
     "zstandard>=0.22.0",
     "beautifulsoup4>=4.12.0",
-    "tqdm>=4.67.3"
+    "tqdm>=4.67.3",
+    "scipy>=1.17.1",
+    "python-dotenv>=1.2.2"
 ]
 
 [project.optional-dependencies]
