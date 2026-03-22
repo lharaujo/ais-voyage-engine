@@ -186,6 +186,23 @@ def main() -> None:
         st.warning(f"⚠️ No data found at: {data_url}")
         return
 
+    # Add Date Filter
+    if "dep_time" in df.columns:
+        df["dep_time"] = pd.to_datetime(df["dep_time"])
+        min_date = df["dep_time"].min().date()
+        max_date = df["dep_time"].max().date()
+
+        st.sidebar.header("🗓️ Date Filter")
+        date_range = st.sidebar.date_input(
+            "Filter by Departure Date",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date,
+        )
+        if len(date_range) == 2:
+            start_date, end_date = date_range
+            df = df[(df["dep_time"].dt.date >= start_date) & (df["dep_time"].dt.date <= end_date)]
+
     st.sidebar.header("🚢 Fleet Search")
 
     search_imo_name = (
@@ -198,14 +215,17 @@ def main() -> None:
         .upper()
     )
 
-    search_dep_locode = (
-        st.sidebar.text_input(
-            "Enter Departure Location Code",
-            placeholder="e.g. USNYC",
-            help="Search for voyages departing from a specific location.",
-        )
-        .strip()
-        .upper()
+    unique_locodes = (
+        sorted(df["dep_locode"].dropna().astype(str).str.upper().unique().tolist())
+        if "dep_locode" in df.columns
+        else []
+    )
+
+    search_dep_locode = st.sidebar.selectbox(
+        "Select Departure Location Code",
+        options=[""] + unique_locodes,
+        format_func=lambda x: "All" if x == "" else x,
+        help="Search for voyages departing from a specific location.",
     )
 
     render_vessel_view(df, search_imo_name, search_dep_locode)

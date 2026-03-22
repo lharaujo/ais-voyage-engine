@@ -154,11 +154,28 @@ def daily_update():
     now = datetime.now()
     # Run for previous month if today is early in the month, or current month
     # Here we default to current month for simplicity
-    full_pipeline.remote(now.year, now.month)
+    full_pipeline.remote(now.year, now.month, now.day)
     sync_to_github.remote()
 
 
 @app.local_entrypoint()
-def main(year: int = 2025, month: int = 1, day: int = None):
-    full_pipeline.remote(year, month, day)
+def main(year: int = 2025, month: int = None, day: int = None):
+    if month is None:
+        print(f"Year {year} selected.")
+        choice = input(
+            "Which month should be downloaded? (Enter 1-12, or press Enter for whole year): "
+        ).strip()
+
+        if not choice:
+            print(f"Downloading data for the whole year {year}...")
+            for m in range(1, 13):
+                full_pipeline.remote(year, m, day)
+        else:
+            try:
+                full_pipeline.remote(year, int(choice), day)
+            except ValueError:
+                print("Invalid month entered.")
+                return
+    else:
+        full_pipeline.remote(year, month, day)
     sync_to_github.remote()
