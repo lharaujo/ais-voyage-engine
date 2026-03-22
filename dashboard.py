@@ -1,50 +1,22 @@
-import io
 import json
-from typing import Optional
+import os
 
 import folium
-import modal
 import pandas as pd
 import streamlit as st
 from streamlit_folium import st_folium
 
-# Try to find the latest voyages file
 
-VOL = modal.Volume.from_name("ais-data-store")
+@st.cache_data(ttl=3600)
+def load_data(url: str) -> pd.DataFrame:
+    """Load voyage data directly from GitHub."""
+    storage_options = None
+    token = os.environ.get("GH_TOKEN")
+    if token:
+        storage_options = {"Authorization": f"token {token}"}
 
-
-def find_latest_voyages_file() -> Optional[str]:
-    """Find the most recent voyages parquet file."""
-
-    files_l = []
-    for file in VOL.listdir("gold"):
-        if file.type == modal.volume.FileEntryType.FILE and "voyages" in file.path:
-            files_l.append(file)
-
-    if not files_l:
-        st.warning("⚠️ No voyage files found in volume.")
-        return None
-    latest_file = max(files_l, key=lambda f: f.path)
-    return latest_file.path
-
-
-DATA_SOURCE = find_latest_voyages_file()
-
-
-@st.cache_data
-def load_data() -> pd.DataFrame:
-    """Load voyage data from parquet file."""
     try:
-        # 1. Stream the file content into a buffer
-        buffer = io.BytesIO()
-        for chunk in VOL.read_file(DATA_SOURCE):
-            buffer.write(chunk)
-        buffer.seek(0)  # Reset buffer pointer to the start
-
-        # 2. Load into DuckDB or Pandas
-        # Since it's now in memory, read_parquet works on the buffer
-        df = pd.read_parquet(buffer)
-        return df
+        return pd.read_parquet(url, storage_options=storage_options)
     except Exception as e:
         st.error(f"❌ Error loading data: {e}")
         return pd.DataFrame()
@@ -65,6 +37,11 @@ def render_vessel_view(data: pd.DataFrame, search_imo_name: str, search_locode: 
             search_upper
         ) | filtered_df["vessel_name"].astype(str).str.upper().str.contains(search_upper)
         filtered_df = filtered_df[is_ship]
+
+    # LIMIT: If no filters are active, limit to 100 rows to prevent browser crash on map render
+    if not search_imo_name and not search_locode:
+        st.info("ℹ️ Showing latest 100 voyages (Global View). Use filters to see specific data.")
+        filtered_df = filtered_df.head(100)
 
     # Display metrics and info per ship
     if search_imo_name and not filtered_df.empty:
@@ -90,8 +67,6 @@ def render_vessel_view(data: pd.DataFrame, search_imo_name: str, search_locode: 
             st.metric("Avg Speed (kts)", f"{avg_speed:.1f}")
     elif search_imo_name:
         st.error(f"🚫 No voyages found for '{search_imo_name}' with current filters.")
-    else:
-        st.info("🌍 Displaying global traffic. Use the sidebar to track a specific ship.")
 
     # Display metrics for location-based search
     if search_locode and not filtered_df.empty:
@@ -109,18 +84,20 @@ def render_vessel_view(data: pd.DataFrame, search_imo_name: str, search_locode: 
             with col3:
                 st.metric("Total # of Voyages", ship_visits)
     elif search_locode:
-        st.error(f"🚫 No voyages found departing from **{search_locode}** with current filters.")
-    else:
-        st.info("📍 Use the sidebar to filter by departure location code.")
+        st.error(f"🚫 No voyages found departing from **{search_locode}**.")
+
     st.dataframe(filtered_df)
     # Create visualization
-    if not filtered_df.empty and (search_imo_name or search_locode):
+    if not filtered_df.empty:
         # 1. Initialize the Folium Map
         # Navigation-night style equivalent in Folium is usually CartoDB dark_matter
         m = folium.Map(location=[20, 0], zoom_start=2, control_scale=True, tiles="cartodb positron")
         folium.TileLayer(
             tiles="https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png",
-            attr="Map data: &copy; <a href='http://www.openseamap.org'>OpenSeaMap</a> contributors",
+            attr=(
+                "Map data: &copy; <a href='http://www.openseamap.org'>OpenSeaMap</a>"
+                " contributors"
+            ),
             name="OpenSeaMap",
             overlay=True,
         ).add_to(m)
@@ -167,8 +144,10 @@ def render_vessel_view(data: pd.DataFrame, search_imo_name: str, search_locode: 
                     color=color,
                     weight=weight,
                     opacity=0.8,
-                    tooltip=f"Vessel: {row['vessel_name']}<br>From: "
-                    "{row['dep_locode']} to {row['arr_locode']}",
+                    tooltip=(
+                        f"Vessel: {row['vessel_name']}<br>"
+                        f"From: {row['dep_locode']} to {row['arr_locode']}"
+                    ),
                 ).add_to(m)
 
             except Exception as e:
@@ -189,9 +168,22 @@ def main() -> None:
     """Main dashboard application."""
     st.set_page_config(page_title="AIS Fleet Tracker", layout="wide", page_icon="⚓")
 
-    df = load_data()
+    # GitHub Configuration in Sidebar
+    with st.sidebar.expander("⚙️ Data Source Config", expanded=False):
+        repo_owner = st.text_input(
+            "Repo Owner", value=os.environ.get("REPO_OWNER", "your-github-username")
+        )
+        repo_name = st.text_input(
+            "Repo Name", value=os.environ.get("REPO_NAME", "ais-voyage-engine")
+        )
+        branch = st.text_input("Branch", value="main")
+        path = st.text_input("Path", value="data/gold/voyages.parquet")
+
+    data_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/{branch}/{path}"
+
+    df = load_data(data_url)
     if df.empty:
-        st.warning("⚠️ No voyage data found. Please run the pipeline first.")
+        st.warning(f"⚠️ No data found at: {data_url}")
         return
 
     st.sidebar.header("🚢 Fleet Search")
