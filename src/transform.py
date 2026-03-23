@@ -162,8 +162,25 @@ async def stitch_voyages(year: int, month: int, settings: Optional[AppSettings] 
         df_enriched = df_enriched.with_columns(pl.lit(12.5).alias("avg_speed_kts"))
 
         GOLD_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Append to existing Gold data if it exists
+        if output_path.exists():
+            logger.info(f"📚 Appending to existing Gold file: {output_path}")
+            try:
+                existing_df = pl.read_parquet(output_path)
+                # Concatenate and remove duplicates based on unique voyage identifiers
+                df_enriched = pl.concat([existing_df, df_enriched], how="vertical_relaxed")
+                df_enriched = df_enriched.unique(subset=["mmsi", "dep_time", "arr_time"])
+            except Exception as e:
+                logger.error(f"⚠️ Failed to read existing Gold file, creating new one: {e}")
+
         df_enriched.write_parquet(output_path, compression="snappy")
-        logger.info(f"🏆 Gold layer saved: {output_path} ({len(df_enriched)} rows)")
+        logger.info(f"🏆 Gold layer updated: {output_path} (Total: {len(df_enriched)} rows)")
+
+        # 7. Cleanup Silver Files
+        logger.info("🧹 Cleaning up processed Silver files...")
+        for f in SILVER_DIR.glob(f"ais_{year}_{month:02d}*.parquet"):
+            f.unlink(missing_ok=True)
 
     except Exception as e:
         logger.error(f"❌ Transformation failed: {e}")
